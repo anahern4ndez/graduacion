@@ -1,10 +1,15 @@
 # Databricks notebook source
 # pyspark imports 
-from pyspark.sql.functions import col, to_date, to_timestamp, lit, concat, date_format, sha2, concat_ws, avg, min, unbase64, when
+from pyspark.sql.functions import col, to_date, to_timestamp, lit, concat, date_format, sha2, concat_ws, avg, min, unbase64, when, date_trunc
 import pyspark.sql.functions as f
 from pyspark.sql import SparkSession, DataFrameWriter
 from pyspark.sql.types import StringType, IntegerType, StructType, StructField
 from pyspark.sql.column import Column
+from pyspark.sql.window import Window
+
+# python imports
+from datetime import datetime
+import pytz
 
 # COMMAND ----------
 
@@ -368,94 +373,114 @@ def foreach_batch_func2(df, batchId):
 # COMMAND ----------
 
 
-# calculos en batch 
-_1hr_batch = (
-  iot_strm_select
-  # para el calculo del aqi se redondean las mediciones obtenidas
-  .withColumn("data_no2", when(col("data_no2") < 0, 0).otherwise(f.round("data_no2", 0)))
-  .withColumn("data_so2", when(col("data_so2") < 0, 0).otherwise(f.round("data_so2", 0)))
-  .withWatermark('date_time', '61 minutes')
-  .groupBy(f.window('date_time', "1 hour", "1 hour"), "sensor_id")
-
+iot_data_table = (
+  spark
+  .read
+  .format("jdbc")
+  .option("url", url)
+  .option("dbtable", sensor_data_table)
+  .option("user", user)
+  .option("password", password)
+  .load()
+  # filtramos las ultimas 10 horas, lo demas no nos sirve para el calculo
+  .withColumn("ms_time", date_trunc("Hour", f.from_utc_timestamp(f.current_timestamp(),"America/Guatemala")) - f.expr('INTERVAL 10 HOURS'))
+  .filter("date_time > ms_time")
+  .withColumn("timestamp_trunc", date_trunc("Hour", col("date_time")))
+  .groupBy("sensor_id", "ms_time", "timestamp_trunc")
   .agg(
     f.max('data_no2').alias("max_no2"), f.max('data_so2').alias("max_so2"),
-    avg('temp').alias("temp_avg"), avg('humidity').alias("humidity_avg")
-    #f.max('data_co').alias("max_co"), f.max('data_o3').alias("max_o3")
+    avg('temp').alias("temp_avg"), avg('humidity').alias("humidity_avg"),
+    f.max('data_co').alias("max_co"), f.max('data_o3').alias("max_o3")
     
   )
-
-           
+  .withColumn("measure_window_start_1hr", col("timestamp_trunc") - f.expr('INTERVAL 1 HOURS'))
+  .withColumn("measure_window_start_8hr", col("timestamp_trunc") - f.expr('INTERVAL 8 HOURS'))
+  .orderBy(col("timestamp_trunc").desc(), "sensor_id")
+  .withColumn("max_co_8hrs", f.max("max_co").over(Window.partitionBy("sensor_id")))
+  .withColumn("max_o3_8hrs", f.max("max_o3").over(Window.partitionBy("sensor_id")))
+  
+  .withColumnRenamed("timestamp_trunc", "measure_window_end")
+  # calculos de aqi 
+  
   .withColumn("no2_aqi", (f.udf(convert_measure_udf)(col("max_no2"), f.lit("NO2"))).cast('float'))
   .withColumn("so2_aqi", (f.udf(convert_measure_udf)(col("max_so2"), f.lit("SO2"))).cast('float'))
-  .withColumn("measure_window_start_1hr", col("window.start"))
-  .withColumn("measure_window_end", col("window.end"))
-#   .orderBy("window.end")
+  .withColumn("co_aqi", (f.udf(convert_measure_udf)(col("max_co_8hrs"), f.lit("CO"))).cast('float'))
+  .withColumn("o3_aqi", (f.udf(convert_measure_udf)(col("max_o3_8hrs"), f.lit("O3"))).cast('float'))
+)
+
+display(iot_data_table)
+
+# COMMAND ----------
+
+_1hr_batch = (
+  iot_data_table
+  .withColumn("timestamp_trunc", date_trunc("Hour", col("date_time")))
+  .groupBy("sensor_id", "timestamp_trunc")
+  .agg(
+    f.max('data_no2').alias("max_no2"), f.max('data_so2').alias("max_so2"),
+    avg('temp').alias("temp_avg"), avg('humidity').alias("humidity_avg"),
+    f.max('data_co').alias("max_co"), f.max('data_o3').alias("max_o3")
+    
+  )
+  .orderBy(col("timestamp_trunc").desc(), "sensor_id")
 )
 
 # COMMAND ----------
 
-# iot_8hr_strm = (
-#   spark.readStream.format("eventhubs")                                               # Read from IoT Hubs directly
-#   .options(**ehConf)                                                               # Use the Event-Hub-enabled connect string
-#   .load()                                                                          # Load the data
-#   .withColumn('reading', f.from_json(col('body').cast('string'), schema))        # Extract the "body" payload from the messages
-#   .withColumn("ms_time", f.from_utc_timestamp(f.current_timestamp(),"America/Guatemala"))
-# #  .withColumn("ms_time", col("reading.TIMESTAMP"))
-#   .withColumn("data_no2", col("reading.NO2").cast('float'))
-#   .withColumn("data_so2", col("reading.SO2").cast('float'))
-#   .withColumn("data_co", col("reading.CO").cast('float'))
-#   .withColumn("data_o3", col("reading.O3").cast('float'))
-#   .withColumn("temp", col("reading.TEMPERATURE").cast('float'))
-#   .withColumn("humidity", col("reading.HUMIDITY").cast('float'))
-#   .withColumn("sensor_id", col("reading.deviceId"))
-#   .fillna(0, ["data_no2", "data_so2", "data_co", "data_o3", "temp", "humidity", "sensor_id"])
-#   .withColumn("entry_uid_tmp", concat(col("sensor_id"), lit("_"), date_format(col("ms_time"), "ddMMyyyy.HHmmss")))
-#   .withColumn("entry_uid", sha2(concat_ws("_", *["entry_uid_tmp", "data_co", "data_o3", "data_no2", "data_so2", "humidity", "temp"]), 256))
-  
-#   .withColumnRenamed("ms_time", "date_time")
-#   .select("sensor_id", "entry_uid", "date_time", "data_co", "data_o3", "data_no2", "data_so2", "humidity", "temp")
+display(iot_data_table)
+
+# COMMAND ----------
+
+max_time_per_station = (
+  iot_strm_select.groupBy("sensor_id").agg(f.max("date_time").alias("max_timestamp"))
+  .withColumn("max_timestamp_trunc", date_trunc("Hour", col("max_timestamp")))
+  .join(iot_data_table
+        .withColumnRenamed("date_time", "timestamp")
+        .withColumnRenamed("sensor_id", "sid"), (col("sensor_id") == col("sid") ) & (col("timestamp").between(col("max_timestamp_trunc"), col("max_timestamp_trunc") - f.expr('INTERVAL 8 HOURS'))), "left")
+  .withColumn("max_timestamp_trunc", date_trunc("Hour", col("max_timestamp")))
+  .select("sensor_id", "max_timestamp_trunc")
+)
+
+# max_time_per_station = (
+#   iot_data_table.groupBy().agg(f.max("date_time").alias("max_timestamp"))
+#   .withColumn("max_timestamp_trunc", date_trunc("Hour", col("max_timestamp")))
 # )
 
-# display(iot_8hr_strm)
+# COMMAND ----------
+
+display(max_time_per_station)
 
 # COMMAND ----------
 
-
-# calculos en batch 
 _8hr_batch = (
-  iot_strm_select
-#   .withWatermark('ms_time', '61 minutes')
-#   .groupBy(f.window('ms_time', "1 hour", "1 hour"), "sensor_id")
-  # para el calculo del aqi se redondean las mediciones obtenidas
-  .withColumn("data_co", when(col("data_co") < 0, 0).otherwise(f.round("data_co", 1)))
-  .withColumn("data_o3", when(col("data_o3") < 0, 0).otherwise(f.round("data_o3", 3)))
-  .groupBy(f.window('date_time', "8 hour", "1 hour"), "sensor_id")
+  max_time_per_station.join(iot_data_table, (date_trunc("Hour", col("date_time")) <= col("max_timestamp_trunc")) & (date_trunc("Hour", col("date_time")) >= (col("max_timestamp_trunc") - f.expr('INTERVAL 8 HOURS'))), "left")
+  .withColumn("measure_window_end", col("max_timestamp_trunc"))
+  .withColumn("timestamp_trunc", date_trunc("Hour", col("date_time")))
 
-  .agg(f.max('data_co').alias("max_co"), f.max('data_o3').alias("max_o3"))
+  .withColumn("general_aqi", f.udf(calculate_general_aqi) (col("no2_aqi"), col("so2_aqi"), col("co_aqi"), col("o3_aqi")))
+  .withColumn("entry_uid", sha2(concat_ws("_", *["measure_window_end", "sensor_id", "co_aqi", "o3_aqi", "no2_aqi", "so2_aqi", "humidity_avg", "temp_avg"]), 256))
+  .withColumn("aqi_range", 
+             when((col("general_aqi") > 0) & (col("general_aqi") < 50), 1)
+             .when((col("general_aqi") > 51) & (col("general_aqi") < 100), 2)
+             .when((col("general_aqi") > 101) & (col("general_aqi") < 150), 3)
+             .when((col("general_aqi") > 151) & (col("general_aqi") < 200), 4)
+             .when((col("general_aqi") > 201) & (col("general_aqi") < 250), 5)
+             .when((col("general_aqi") > 251), 6)
 
-           
-  .withColumn("co_aqi", (f.udf(convert_measure_udf)(col("max_co"), f.lit("CO"))).cast('float'))
-  .withColumn("o3_aqi", (f.udf(convert_measure_udf)(col("max_o3"), f.lit("O3"))).cast('float'))
-#   .withColumn("general_aqi", f.udf(calculate_general_aqi) (col("no2_aqi"), col("so2_aqi"), col("co_aqi"), col("o3_aqi")))
-  .withColumn("measure_window_start_8hr", col("window.start"))
-  .withColumn("measure_window_end", col("window.end"))
-#   .withColumn("entry_uid", sha2(concat_ws("_", *["measure_window_start", "measure_window_end", "sensor_id", "co_aqi", "o3_aqi", "no2_aqi", "so2_aqi", "humidity_avg", "temp_avg"]), 256))
-#   .select("measure_window_start", "measure_window_end", "co_aqi", "so2_aqi", "no2_aqi", "o3_aqi", "general_aqi", "temp_avg", "humidity_avg", "entry_uid", "sensor_id")
-#   .count()
-  .orderBy("window.end")
-)
+  )
 
-# display(_8hr_batch)
-
-# COMMAND ----------
-
+).select("measure_window_start_1hr", "measure_window_start_8hr", "measure_window_end", "co_aqi", "so2_aqi", "no2_aqi", "o3_aqi", "general_aqi", "temp_avg", "humidity_avg", "entry_uid", "sensor_id")
+  
 display(_8hr_batch)
 
 # COMMAND ----------
 
 processed_data = (
-  _8hr_batch.drop("window")
-  .join(_1hr_batch.drop("window"), ["measure_window_end", "sensor_id"], "left")
+#   _8hr_batch.drop("window")
+#   .join(_1hr_batch.drop("window"), ["measure_window_end", "sensor_id"], "left")
+  
+  
+  
   .withColumn("general_aqi", f.udf(calculate_general_aqi) (col("no2_aqi"), col("so2_aqi"), col("co_aqi"), col("o3_aqi")))
   .withColumn("entry_uid", sha2(concat_ws("_", *["measure_window_end", "sensor_id", "co_aqi", "o3_aqi", "no2_aqi", "so2_aqi", "humidity_avg", "temp_avg"]), 256))
   .select("measure_window_start_1hr", "measure_window_start_8hr", "measure_window_end", "co_aqi", "so2_aqi", "no2_aqi", "o3_aqi", "general_aqi", "temp_avg", "humidity_avg", "entry_uid", "sensor_id")
@@ -479,14 +504,13 @@ display(processed_data)
 
 # escribir los datos recibidos de los sensores a la tabla de SQL server => iot_data
 try:
-  (iot_strm_select.writeStream \
+  (processed_data.writeStream \
 #     .format("com.microsoft.sqlserver.jdbc.spark") \
 #     .option("url", url) \
 #     .option("dbtable", sensor_data_table) \
 #     .option("user", user) \
 #     .option("password", password) \
-#     .outputMode("update") \
-    .foreachBatch(foreach_batch_func2)
+    .outputMode("update") \
    .trigger(processingTime = '10 minutes')
    
 #      .outputMode("complete")
