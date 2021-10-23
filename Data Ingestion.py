@@ -300,6 +300,11 @@ def calculate_general_aqi(p1, p2, p3, p4):
 
 # COMMAND ----------
 
+gt_time = datetime.now().astimezone(pytz.timezone('America/Guatemala'))
+print(gt_time)
+
+# COMMAND ----------
+
 """
   La siguiente funcion se utiliza para hacer un writestream 
 """
@@ -308,67 +313,75 @@ import pytz
 #   fdf = DataFrameWriter(df)
 #   fdf.jdbc(url=url, table= sensor_data_table, mode ="append", properties = properties)
 def foreach_batch_func2(df, batchId):
-#   mx_time = datetime.now().astimezone(pytz.timezone('America/Guatemala'))
-#   _1hr_batch = (
-#   df
-#   # para el calculo del aqi se redondean las mediciones obtenidas
-#   .withColumn("data_no2", when(col("data_no2") < 0, 0).otherwise(f.round("data_no2", 0)))
-#   .withColumn("data_so2", when(col("data_so2") < 0, 0).otherwise(f.round("data_so2", 0)))
-#   .withWatermark('date_time', '61 minutes')
-#   .groupBy(f.window('date_time', "1 hour", "1 hour"), "sensor_id")
-#   .agg(
-#     f.max('data_no2').alias("max_no2"), f.max('data_so2').alias("max_so2"),
-#     avg('temp').alias("temp_avg"), avg('humidity').alias("humidity_avg") 
-#   )
-#   .withColumn("no2_aqi", (f.udf(convert_measure_udf)(col("max_no2"), f.lit("NO2"))).cast('float'))
-#   .withColumn("so2_aqi", (f.udf(convert_measure_udf)(col("max_so2"), f.lit("SO2"))).cast('float'))
-#   .withColumn("measure_window_start_1hr", col("window.start"))
-#   .withColumn("measure_window_start_8hr", f.lit(mx_time).cast('timestamp'))
-#   .withColumn("measure_window_end", col("window.end"))
-#   .withColumn("entry_uid", f.lit(batchId))
-#   ).select("measure_window_start_1hr", "measure_window_start_8hr", "measure_window_end", "so2_aqi", "no2_aqi","temp_avg", "humidity_avg", "sensor_id", "entry_uid")
-  
-#   fdf = DataFrameWriter(_1hr_batch)
-#   fdf.jdbc(url=url, table= "pd_1hr", mode ="append", properties = properties)
-  
-#   _8hr_batch = (
-#       df
-#       # para el calculo del aqi se redondean las mediciones obtenidas
-#       .withColumn("data_co", when(col("data_co") < 0, 0).otherwise(f.round("data_co", 1)))
-#       .withColumn("data_o3", when(col("data_o3") < 0, 0).otherwise(f.round("data_o3", 3)))
-#       .groupBy(f.window('date_time', "6 hour", "1 hour"), "sensor_id")
-#       .agg(f.max('data_co').alias("max_co"), f.max('data_o3').alias("max_o3"))
-#       .withColumn("co_aqi", (f.udf(convert_measure_udf)(col("max_co"), f.lit("CO"))).cast('float'))
-#       .withColumn("o3_aqi", (f.udf(convert_measure_udf)(col("max_o3"), f.lit("O3"))).cast('float'))
-#       .withColumn("measure_window_start_8hr", col("window.start"))
-#       .withColumn("measure_window_end", col("window.end"))
-#   .withColumn("measure_window_start_1hr", f.lit(mx_time).cast('timestamp'))
-#       .orderBy("window.end")
-#       .withColumn("entry_uid", f.lit(batchId))
-#     ).select("measure_window_start_1hr", "measure_window_start_8hr", "measure_window_end", "co_aqi","o3_aqi", "sensor_id", "entry_uid")
-#   fdf = DataFrameWriter(_8hr_batch)
-#   fdf.jdbc(url=url, table= "pd_8hr", mode ="append", properties = properties)
-  
+  gt_time = datetime.now().astimezone(pytz.timezone('America/Guatemala'))
+  max_time_per_station = (
+    df
+    .withWatermark("date_time", "1 minute")
+  #   .withColumn("row_num", f.row_number().over(Window.partitionBy("sensor_id").orderBy(col("date_time").desc())))
+  #   .filter("row_num = 1")
+    .groupBy(f.window('date_time', "1 hour", "1 hour"), "sensor_id")
+    .agg(f.max("date_time"))
+  #   .orderBy(col("window.start").desc())
+    .withColumn("max_timestamp_trunc", date_trunc("Hour", col("max(date_time)")))
+    .filter(col("max_timestamp_trunc") == date_trunc("Hour", f.from_utc_timestamp(f.current_timestamp(),"America/Guatemala"))) # aseguramos de obtener unicamente la ultima hora
+  )
 
-#   processed_data = (
-#     _8hr_batch.drop("window", "entry_uid", "measure_window_start_1hr")
-#     .join(_1hr_batch.drop("window", "entry_uid", "measure_window_start_8hr"), ["measure_window_end", "sensor_id"], "inner")
-#     .withColumn("general_aqi", f.udf(calculate_general_aqi) (col("no2_aqi"), col("so2_aqi"), col("co_aqi"), col("o3_aqi")))
-#     .withColumn("entry_uid", sha2(concat_ws("_", *["measure_window_end", "sensor_id", "co_aqi", "o3_aqi", "no2_aqi", "so2_aqi", "humidity_avg", "temp_avg"]), 256))
-#     .withColumn("aqi_range", 
-#                when((col("general_aqi") > 0) & (col("general_aqi") < 50), 1)
-#                .when((col("general_aqi") > 51) & (col("general_aqi") < 100), 2)
-#                .when((col("general_aqi") > 101) & (col("general_aqi") < 150), 3)
-#                .when((col("general_aqi") > 151) & (col("general_aqi") < 200), 4)
-#                .when((col("general_aqi") > 201) & (col("general_aqi") < 250), 5)
-#                .when((col("general_aqi") > 251), 6)
+  iot_data_table = (
+    spark
+    .read
+    .format("jdbc")
+    .option("url", url)
+    .option("dbtable", sensor_data_table)
+    .option("user", user)
+    .option("password", password)
+    .load()
+    # filtramos las ultimas 10 horas, lo demas no nos sirve para el calculo
+    .withColumn("ms_time", date_trunc("Hour", f.from_utc_timestamp(f.current_timestamp(),"America/Guatemala")) - f.expr('INTERVAL 10 HOURS'))
+    .filter("date_time > ms_time")
+    .withColumn("timestamp_trunc", date_trunc("Hour", col("date_time")))
+    .groupBy("sensor_id", "ms_time", "timestamp_trunc")
+    .agg(
+      f.max('data_no2').alias("max_no2"), f.max('data_so2').alias("max_so2"),
+      avg('temp').alias("temp_avg"), avg('humidity').alias("humidity_avg"),
+      f.max('data_co').alias("max_co"), f.max('data_o3').alias("max_o3")
 
-#     )
+    )
+    .withColumn("measure_window_start_1hr", col("timestamp_trunc") - f.expr('INTERVAL 1 HOURS'))
+    .withColumn("measure_window_start_8hr", col("timestamp_trunc") - f.expr('INTERVAL 8 HOURS'))
+    .orderBy(col("timestamp_trunc").desc(), "sensor_id")
+    .withColumn("max_co_8hrs", f.max("max_co").over(Window.partitionBy("sensor_id")))
+    .withColumn("max_o3_8hrs", f.max("max_o3").over(Window.partitionBy("sensor_id")))
 
-#   ).select("measure_window_start_1hr", "measure_window_start_8hr", "measure_window_end", "co_aqi", "so2_aqi", "no2_aqi", "o3_aqi", "general_aqi", "temp_avg", "humidity_avg", "entry_uid", "sensor_id")
-  # write a base de datos
-  
-  fdf = DataFrameWriter(df)
+    .withColumnRenamed("timestamp_trunc", "measure_window_end")
+    # calculos de aqi 
+
+    .withColumn("no2_aqi", (f.udf(convert_measure_udf)(col("max_no2"), f.lit("NO2"))).cast('float'))
+    .withColumn("so2_aqi", (f.udf(convert_measure_udf)(col("max_so2"), f.lit("SO2"))).cast('float'))
+    .withColumn("co_aqi", (f.udf(convert_measure_udf)(col("max_co_8hrs"), f.lit("CO"))).cast('float'))
+    .withColumn("o3_aqi", (f.udf(convert_measure_udf)(col("max_o3_8hrs"), f.lit("O3"))).cast('float'))
+  )
+  processed_data = (
+    max_time_per_station.join(iot_data_table.withColumnRenamed("sensor_id", "sid"), 
+          (col("measure_window_end") == col("max_timestamp_trunc")) & (col("measure_window_start_1hr") == (col("max_timestamp_trunc") - f.expr('INTERVAL 1 HOURS')))
+             & (col("sid") == col("sensor_id")), "left")
+
+    .withColumn("general_aqi", f.udf(calculate_general_aqi) (col("no2_aqi"), col("so2_aqi"), col("co_aqi"), col("o3_aqi")))
+    .withColumn("entry_uid", sha2(concat_ws("_", *["measure_window_end", "sensor_id", "co_aqi", "o3_aqi", "no2_aqi", "so2_aqi", "humidity_avg", "temp_avg"]), 256))
+    .withColumn("aqi_range", 
+               when((col("general_aqi") > 0) & (col("general_aqi") < 50), 1)
+               .when((col("general_aqi") > 51) & (col("general_aqi") < 100), 2)
+               .when((col("general_aqi") > 101) & (col("general_aqi") < 150), 3)
+               .when((col("general_aqi") > 151) & (col("general_aqi") < 200), 4)
+               .when((col("general_aqi") > 201) & (col("general_aqi") < 250), 5)
+               .when((col("general_aqi") > 251), 6)
+
+    )
+  #   .withWatermark('measure_window_end', '59 minutes')
+
+
+  ).select("measure_window_start_1hr", "measure_window_start_8hr", "measure_window_end", "co_aqi", "so2_aqi", "no2_aqi", "o3_aqi", "general_aqi", "temp_avg", "humidity_avg", "entry_uid", "sensor_id")
+
+  fdf = DataFrameWriter(processed_data)
   fdf.jdbc(url=url, table= "processed_data", mode ="append", properties = properties)
 
 # COMMAND ----------
@@ -407,48 +420,43 @@ iot_data_table = (
   .withColumn("so2_aqi", (f.udf(convert_measure_udf)(col("max_so2"), f.lit("SO2"))).cast('float'))
   .withColumn("co_aqi", (f.udf(convert_measure_udf)(col("max_co_8hrs"), f.lit("CO"))).cast('float'))
   .withColumn("o3_aqi", (f.udf(convert_measure_udf)(col("max_o3_8hrs"), f.lit("O3"))).cast('float'))
-  .withWatermark('ms_time', '61 minutes')
 )
 
 display(iot_data_table)
 
 # COMMAND ----------
 
-_1hr_batch = (
-  iot_data_table
-  .withColumn("timestamp_trunc", date_trunc("Hour", col("date_time")))
-  .groupBy("sensor_id", "timestamp_trunc")
-  .agg(
-    f.max('data_no2').alias("max_no2"), f.max('data_so2').alias("max_so2"),
-    avg('temp').alias("temp_avg"), avg('humidity').alias("humidity_avg"),
-    f.max('data_co').alias("max_co"), f.max('data_o3').alias("max_o3")
-    
+gt_time = datetime.now().astimezone(pytz.timezone('America/Guatemala'))
+print(gt_time)
+
+# COMMAND ----------
+
+  max_time_per_station = (
+    iot_strm_select
+    .withWatermark("date_time", "1 minute")
+  #   .withColumn("row_num", f.row_number().over(Window.partitionBy("sensor_id").orderBy(col("date_time").desc())))
+  #   .filter("row_num = 1")
+    .groupBy(f.window('date_time', "1 hour", "1 hour"), "sensor_id")
+    .agg(f.max("date_time"))
+  #   .orderBy(col("window.start").desc())
+    .withColumn("max_timestamp_trunc", date_trunc("Hour", col("max(date_time)")))
+    .withColumn("now_trunc", date_trunc("Hour", f.from_utc_timestamp(f.current_timestamp(),"America/Guatemala")))
+#     .filter(col("max_timestamp_trunc") == date_trunc("Hour", f.lit(gt_time).cast('timestamp')))
   )
-  .orderBy(col("timestamp_trunc").desc(), "sensor_id")
-)
-
-# COMMAND ----------
-
-display(iot_data_table)
-
-# COMMAND ----------
-
-max_time_per_station = (
-  iot_strm_select
-    .withWatermark("date_time", "59 minutes")
-  .groupBy("sensor_id").agg(f.max("date_time").alias("max_timestamp"))
-  .withColumn("max_timestamp_trunc", date_trunc("Hour", col("max_timestamp")))
+#   .groupBy("sensor_id").agg(f.max("date_time").alias("max_timestamp"))
+#   .withColumn("max_timestamp_trunc", date_trunc("Hour", col("max_timestamp")))
 #   .join(iot_data_table
 #         .withColumnRenamed("date_time", "timestamp")
 #         .withColumnRenamed("sensor_id", "sid"), (col("sensor_id") == col("sid") ) & (col("timestamp").between(col("max_timestamp_trunc"), col("max_timestamp_trunc") - f.expr('INTERVAL 8 HOURS'))), "left")
 #   .withColumn("max_timestamp_trunc", date_trunc("Hour", col("max_timestamp")))
-  .select("sensor_id", "max_timestamp_trunc")
-)
+  
+#   .select("sensor_id", "max_timestamp_trunc")
 
 # max_time_per_station = (
 #   iot_data_table.groupBy().agg(f.max("date_time").alias("max_timestamp"))
 #   .withColumn("max_timestamp_trunc", date_trunc("Hour", col("max_timestamp")))
 # )
+display(max_time_per_station)
 
 # COMMAND ----------
 
@@ -458,11 +466,9 @@ display(max_time_per_station)
 
 processed_data = (
   max_time_per_station.join(iot_data_table.withColumnRenamed("sensor_id", "sid"), 
-        (col("measure_window_end") == col("max_timestamp_trunc")) & (col("measure_window_start_8hr") == (col("max_timestamp_trunc") - f.expr('INTERVAL 8 HOURS')))
+        (col("measure_window_end") == col("max_timestamp_trunc")) & (col("measure_window_start_1hr") == (col("max_timestamp_trunc") - f.expr('INTERVAL 1 HOURS')))
            & (col("sid") == col("sensor_id")), "left")
 
-
-  .withWatermark("max_timestamp_trunc", "59 minutes")
   .withColumn("general_aqi", f.udf(calculate_general_aqi) (col("no2_aqi"), col("so2_aqi"), col("co_aqi"), col("o3_aqi")))
   .withColumn("entry_uid", sha2(concat_ws("_", *["measure_window_end", "sensor_id", "co_aqi", "o3_aqi", "no2_aqi", "so2_aqi", "humidity_avg", "temp_avg"]), 256))
   .withColumn("aqi_range", 
@@ -474,30 +480,30 @@ processed_data = (
              .when((col("general_aqi") > 251), 6)
 
   )
-  .withWatermark('max_timestamp_trunc', '59 minutes')
+#   .withWatermark('measure_window_end', '59 minutes')
   
 
 ).select("measure_window_start_1hr", "measure_window_start_8hr", "measure_window_end", "co_aqi", "so2_aqi", "no2_aqi", "o3_aqi", "general_aqi", "temp_avg", "humidity_avg", "entry_uid", "sensor_id")
   
-# display(processed_data)
+display(processed_data)
 
 # COMMAND ----------
 
-# final_df = processed_data.select("measure_window_start_1hr", "measure_window_start_8hr", "measure_window_end", "co_aqi", "so2_aqi", "no2_aqi", "o3_aqi", "general_aqi", "temp_avg", "humidity_avg", "entry_uid", "sensor_id")
+:# final_df = processed_data.select("measure_window_start_1hr", "measure_window_start_8hr", "measure_window_end", "co_aqi", "so2_aqi", "no2_aqi", "o3_aqi", "general_aqi", "temp_avg", "humidity_avg", "entry_uid", "sensor_id")
 
 # COMMAND ----------
 
 # escribir los datos recibidos de los sensores a la tabla de SQL server => iot_data
 try:
-  (processed_data.writeStream \
+  (iot_strm_select.writeStream \
 #        .outputMode("append") \
 #     .format("com.microsoft.sqlserver.jdbc.spark") \
 #     .option("url", url) \
 #     .option("dbtable", "processed_data") \
 #     .option("user", user) \
 #     .option("password", password) \
-   .trigger(processingTime = '1 hour')
    .foreachBatch(foreach_batch_func2)
+   .trigger(processingTime = '1 hour')
     .start())
 except ValueError as error :
     print("Connector write failed", error)
