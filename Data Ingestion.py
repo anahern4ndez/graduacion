@@ -203,8 +203,10 @@ def no2_subindex(x):
         return ((200-151)/(649-361)) * (x - 361) + 151
     elif x <= 1249:
         return ((300-201)/(1249-650)) * (x - 650) + 201
-    elif x > 1249:
+    elif x <= 1649:
         return ((400-301)/(1649-1250)) * (x - 1250) + 301
+    elif x > 1649:
+        return 1650
     else:
         return 0
 
@@ -267,8 +269,10 @@ def so2_subindex(x):
         return ((200-151)/(304-186)) * (x - 186) + 151
     elif x <= 604:
         return ((300-201)/(604-305)) * (x - 305) + 201
-    elif x > 604:
+    elif x <= 804:
         return ((400-301)/(804-605)) * (x - 605) + 301
+    elif x > 804:
+        return 810
     else:
         return 0
 
@@ -305,7 +309,7 @@ def calculate_general_aqi(p1, p2, p3, p4):
     p3 = 0
   if not p4:
     p4 = 0
-  return int(max([p1, p2, p3, p4]))
+  return int(max([int(p1), int(p2), int(p3), int(p4)]))
 
 # COMMAND ----------
 
@@ -325,7 +329,7 @@ def foreach_batch_func2(df, batchId):
   gt_time = datetime.now().astimezone(pytz.timezone('America/Guatemala'))
   max_time_per_station = (
     df
-    .withWatermark("date_time", "1 minute")
+    .withWatermark("date_time", "10 minutes")
   #   .withColumn("row_num", f.row_number().over(Window.partitionBy("sensor_id").orderBy(col("date_time").desc())))
   #   .filter("row_num = 1")
     .groupBy(f.window('date_time', "1 hour", "1 hour"), "sensor_id")
